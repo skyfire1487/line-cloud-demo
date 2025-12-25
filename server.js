@@ -7,6 +7,12 @@ const PORT = process.env.PORT || 3000;
 // // 從Render的Environment Variables讀取LINE的Channel access token
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN || "";
 
+// ★ 新增：從Render的Environment Variables讀取RAG的Base URL
+// 1️⃣ 這是什麼：RAG服務的「根網址」(例如https://rag-agent-903v.onrender.com)
+// 2️⃣ 為什麼現在要做：chat/remind要轉送到RAG的POST/chat，不能寫死在程式碼
+// 3️⃣ 做了會改變什麼：LINE聊天訊息會被轉送到RAG，拿到reply後再回覆LINE
+const RAG_BASE_URL = process.env.RAG_BASE_URL || "";
+
 // // 記住最後一筆指令
 let lastCommand = {
   command: "none",
@@ -78,6 +84,70 @@ function lineReply(replyToken, messages, cb) {
   req.end();
 }
 
+// ★ 新增：呼叫RAG的POST/chat，拿回reply文字
+// 1️⃣ 這是什麼：用HTTP把使用者文字送到RAG服務
+// 2️⃣ 為什麼現在要做：你不做AI，只做「轉送」與「回傳結果」
+// 3️⃣ 做了會改變什麼：cmd=chat或remind時，LINE收到的是RAG的回覆而不是「收到：xxx」
+function callRagChat(userId, text, cb) {
+  if (!RAG_BASE_URL) {
+    return cb(new Error("Missing RAG_BASE_URL"));
+  }
+
+  // 把Base URL組成真正的API URL：{RAG_BASE_URL}/chat
+  let u;
+  try {
+    u = new URL(RAG_BASE_URL.replace(/\/+$/, "") + "/chat");
+  } catch (e) {
+    return cb(new Error("Invalid RAG_BASE_URL"));
+  }
+
+  // 依你RAG服務顯示的routes: POST/chat，常見格式是user_id+text
+  const postData = JSON.stringify({
+    user_id: userId,
+    text: text,
+  });
+
+  const isHttps = u.protocol === "https:";
+  const lib = isHttps ? https : http;
+
+  const options = {
+    hostname: u.hostname,
+    port: u.port || (isHttps ? 443 : 80),
+    path: u.pathname + (u.search || ""),
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(postData),
+    },
+  };
+
+  const req = lib.request(options, (resp) => {
+    let data = "";
+    resp.on("data", (chunk) => (data += chunk));
+    resp.on("end", () => {
+      // 不是2xx就當作失敗，把回傳內容帶回去方便你看錯誤
+      if (!(resp.statusCode >= 200 && resp.statusCode < 300)) {
+        return cb(new Error(`RAG HTTP ${resp.statusCode}: ${data}`));
+      }
+
+      // 預期RAG回傳JSON，例如{ "reply": "..." }
+      let obj = {};
+      try {
+        obj = JSON.parse(data || "{}");
+      } catch (e) {
+        obj = {};
+      }
+
+      const reply = (obj.reply || "").toString();
+      return cb(null, reply);
+    });
+  });
+
+  req.on("error", (e) => cb(e));
+  req.write(postData);
+  req.end();
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
@@ -101,6 +171,10 @@ const server = http.createServer((req, res) => {
       lastCommand.command === "follow" ||
       lastCommand.command === "stop";
 
+    // 這裡回204的意思：
+    // 1️⃣ 這是什麼：HTTP 204=No Content，代表「目前沒有新控制指令給你」
+    // 2️⃣ 為什麼要做：Zenbo一直poll時，沒新指令就不用回JSON，省流量也清楚
+    // 3️⃣ 做了會改變什麼：Android端看到204就知道「不用做事，等下次再問」
     if (!isNew || !isControl) {
       res.writeHead(204);
       return res.end();
@@ -165,16 +239,44 @@ const server = http.createServer((req, res) => {
         ts: Date.now(),
       };
 
+      // 先回200給LINE，避免LINE重送
       sendJson(res, 200, { ok: true });
 
-      if (replyToken) {
-        const replyText =
-          cmd === "chat"
-            ? `收到：${userText}`
-            : `收到指令：${cmd}`;
+      // 沒有replyToken就不能回覆LINE
+      if (!replyToken) return;
 
-        lineReply(replyToken, [{ type: "text", text: replyText }], () => {});
+      // 控制類：維持你原本行為（回收到指令）
+      if (cmd === "spin" || cmd === "follow" || cmd === "stop") {
+        return lineReply(replyToken, [{ type: "text", text: `收到指令：${cmd}` }], () => {});
       }
+
+      // ★ 新增：chat/remind轉送RAG
+      // 1️⃣ 這是什麼：把userText送到RAG的POST/chat，拿reply回覆LINE
+      // 2️⃣ 為什麼現在要做：你要把聊天交給RAG同學處理，不在你這層做AI
+      // 3️⃣ 做了會改變什麼：LINE使用者輸入一般句子或「提醒」，會收到RAG的回答
+      if (cmd === "chat" || cmd === "remind") {
+        // 用LINE的userId當user_id，讓RAG可以分辨不同使用者
+        const userId = (evt.source && evt.source.userId) ? evt.source.userId : "line_user";
+
+        return callRagChat(userId, userText, (err, reply) => {
+          // RAG失敗時給保底訊息，避免demo看起來像整個壞掉
+          if (err) {
+            const fallback = `（RAG暫時無法使用）\n${err.message}`;
+            return lineReply(replyToken, [{ type: "text", text: fallback }], () => {});
+          }
+
+          const text = reply && reply.trim() ? reply : "（RAG沒有回傳reply）";
+          return lineReply(replyToken, [{ type: "text", text }], () => {});
+        });
+      }
+
+      // 其他：維持原本行為
+      const replyText =
+        cmd === "chat"
+          ? `收到：${userText}`
+          : `收到指令：${cmd}`;
+
+      return lineReply(replyToken, [{ type: "text", text: replyText }], () => {});
     });
   }
 
